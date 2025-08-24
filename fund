@@ -1,0 +1,293 @@
+import akshare as ak
+import pandas as pd
+import matplotlib.pyplot as plt
+import numpy as np
+from datetime import datetime, timedelta
+import concurrent.futures
+import multiprocessing
+import time
+from openpyxl.utils import get_column_letter
+plt.rcParams['font.sans-serif'] = ['SimHei']  # 用来正常显示中文标签
+plt.rcParams['axes.unicode_minus'] = False  # 用来正常显示负号
+
+themes = ["白酒", "黄金", "人工智能", "机器人", "半导体", "医药"]
+
+# 用户指定的基金代码和名称
+specific_funds = [
+    {"code": "018124", "name": "永赢先进制造智选混合发起A"}
+]
+
+results = {}
+history_results = {}
+
+# 获取所有开放式基金排行
+df_funds = ak.fund_open_fund_rank_em(symbol="全部")
+
+for theme in themes:
+    # 在基金名称中搜索主题关键词
+    theme_match = df_funds[df_funds["基金简称"].str.contains(theme, na=False)]
+    
+    results[theme] = {
+        "相关基金": theme_match[["基金代码", "基金简称", "单位净值", "日增长率", "近1周", "近1月", "近3月", "近6月", "今年来", "近1年", "近2年", "近3年"]]
+    }
+    
+    # 获取历史数据（取第一只基金作为示例）
+    if not theme_match.empty:
+        fund_code = theme_match.iloc[0]["基金代码"]
+        # 获取过去12个月的数据
+        end_date = datetime.now().strftime("%Y%m%d")
+        start_date = (datetime.now() - timedelta(days=365)).strftime("%Y%m%d")
+        
+        try:
+            # 尝试获取ETF历史数据
+            hist_data = ak.fund_etf_hist_em(symbol=fund_code, period='monthly', 
+                                          start_date=start_date, end_date=end_date)
+        except:
+            try:
+                # 如果ETF数据获取失败，尝试LOF历史数据
+                hist_data = ak.fund_lof_hist_em(symbol=fund_code, period='monthly',
+                                               start_date=start_date, end_date=end_date)
+            except:
+                hist_data = pd.DataFrame()
+        
+        history_results[theme] = hist_data
+
+# 打印各主题基金信息
+for theme, data in results.items():
+    print(f"\n===== {theme} 基金 =====")
+    if not data["相关基金"].empty:
+        print("相关基金：")
+        print(data["相关基金"].head(10))
+    else:
+        print("未找到相关基金")
+
+# 基金数据缓存（避免重复请求相同基金）
+fund_data_cache = {}
+
+# 带重试机制的基金数据获取
+def get_fund_history_data_with_retry(fund_code, days=7, max_retries=3):
+    """获取基金历史数据（带缓存和重试功能）"""
+    # 检查缓存
+    cache_key = f"{fund_code}_{days}"
+    if cache_key in fund_data_cache:
+        return fund_data_cache[cache_key].copy()
+    
+    end_date = datetime.now().strftime("%Y%m%d")
+    start_date = (datetime.now() - timedelta(days=days)).strftime("%Y%m%d")
+    
+    # 重试机制
+    for attempt in range(max_retries):
+        try:
+            # 首先尝试开放式基金数据接口（适用于混合型基金）
+            hist_data = ak.fund_open_fund_info_em(symbol=fund_code, indicator="单位净值走势")
+            if not hist_data.empty:
+                # 重命名列以统一格式
+                hist_data = hist_data.rename(columns={'净值日期': '日期', '单位净值': '收盘'})
+                # 过滤最近days天的数据
+                hist_data['日期'] = pd.to_datetime(hist_data['日期'])
+                hist_data = hist_data[hist_data['日期'] >= pd.to_datetime(start_date)]
+                # 缓存结果
+                fund_data_cache[cache_key] = hist_data.copy()
+                return hist_data
+        except Exception as e:
+            if attempt == max_retries - 1:
+                print(f"警告: 获取基金 {fund_code} 数据失败: {str(e)}")
+            continue
+        
+        try:
+            # 如果开放式基金接口失败，尝试ETF接口
+            hist_data = ak.fund_etf_hist_em(symbol=fund_code, period='daily', 
+                                          start_date=start_date, end_date=end_date)
+            if not hist_data.empty:
+                # 确保日期列为datetime类型
+                if '日期' in hist_data.columns:
+                    hist_data['日期'] = pd.to_datetime(hist_data['日期'])
+                # 缓存结果
+                fund_data_cache[cache_key] = hist_data.copy()
+                return hist_data
+        except Exception as e:
+            if attempt == max_retries - 1:
+                print(f"警告: 获取基金 {fund_code} ETF数据失败: {str(e)}")
+            continue
+        
+        try:
+            # 最后尝试LOF接口
+            hist_data = ak.fund_lof_hist_em(symbol=fund_code, period='daily',
+                                           start_date=start_date, end_date=end_date)
+            if not hist_data.empty:
+                # 确保日期列为datetime类型
+                if '日期' in hist_data.columns:
+                    hist_data['日期'] = pd.to_datetime(hist_data['日期'])
+                # 缓存结果
+                fund_data_cache[cache_key] = hist_data.copy()
+                return hist_data
+        except Exception as e:
+            if attempt == max_retries - 1:
+                print(f"警告: 获取基金 {fund_code} LOF数据失败: {str(e)}")
+            continue
+    
+    # 缓存空结果以避免重复请求
+    fund_data_cache[cache_key] = pd.DataFrame()
+    return pd.DataFrame()
+
+# 获取单个基金的历史数据
+def get_fund_history_data(fund_code, days=7):
+    """获取基金历史数据（带缓存功能）"""
+    return get_fund_history_data_with_retry(fund_code, days)
+
+# 生成周度数据报告
+def generate_weekly_report(results):
+    """生成周度数据报告"""
+    print("📊 基金周度涨跌数据报告")
+    print("=" * 50)
+    
+    for theme, data in results.items():
+        if not data["相关基金"].empty:
+            print(f"\n🎯 {theme}主题基金")
+            print("-" * 30)
+            
+            # 显示前5只基金的周度数据
+            weekly_data = data["相关基金"].head(5)[["基金简称", "近1周", "单位净值"]]
+            for _, fund in weekly_data.iterrows():
+                trend = "📈" if fund["近1周"] >= 0 else "📉"
+                print(f"{trend} {fund['基金简称']:20} 周涨跌: {fund['近1周']:6.2f}%  净值: {fund['单位净值']:.3f}")
+    
+    print(f"\n⏰ 报告生成时间: {datetime.now().strftime('%Y-%m-%d %H:%M')}")
+
+# 导出基金数据到Excel表格
+def export_fund_data_to_excel(results, specific_funds):
+    """导出基金数据到Excel表格"""
+    current_date = datetime.now().strftime('%m%d')
+    filename = f"{current_date}_基金数据.xlsx"
+    
+    # 记录开始时间
+    start_time = time.time()
+    
+    # 生成最近一周的日期列表（从6天前到今天，共7天）
+    date_list = []
+    for i in range(6, -1, -1):
+        date = (datetime.now() - timedelta(days=i)).strftime('%m.%d')
+        date_list.append(date)
+    
+    with pd.ExcelWriter(filename, engine='openpyxl') as writer:
+        # 导出各主题基金数据
+        for theme, data in results.items():
+            if not data["相关基金"].empty:
+                # 获取该主题下所有基金的每日增长率数据
+                theme_daily_data = []
+                
+                # 使用线程池并行获取基金历史数据
+                fund_codes = []
+                fund_names = []
+                fund_navs = []
+                
+                for _, fund in data["相关基金"].iterrows():
+                    fund_codes.append(fund["基金代码"])
+                    fund_names.append(fund["基金简称"])
+                    fund_navs.append(fund['单位净值'])
+                
+                # 并行获取所有基金的历史数据（根据CPU核心数动态调整线程数）
+                max_workers = min(len(fund_codes), multiprocessing.cpu_count() * 2)
+                with concurrent.futures.ThreadPoolExecutor(max_workers=max_workers) as executor:
+                    hist_data_list = list(executor.map(get_fund_history_data, fund_codes, [7]*len(fund_codes)))
+                
+                # 处理获取到的历史数据
+                for i, hist_data in enumerate(hist_data_list):
+                    if not hist_data.empty:
+                        # 计算每日增长率
+                        hist_data = hist_data.sort_values('日期')
+                        hist_data['增长率'] = hist_data['收盘'].pct_change() * 100
+                        
+                        # 创建每日增长率数据行
+                        daily_row = {
+                            '基金代码': fund_codes[i],
+                            '基金名称': fund_names[i],
+                            '单位净值': fund_navs[i]
+                        }
+                        
+                        # 填充每日增长率数据
+                        for date_str in date_list:
+                            # 直接使用字符串匹配日期格式
+                            matching_data = hist_data[hist_data['日期'].dt.strftime('%m.%d') == date_str]
+                            
+                            if not matching_data.empty:
+                                # 设置百分比格式，保留两位小数
+                                growth_rate = matching_data['增长率'].iloc[0]
+                                if pd.notna(growth_rate):
+                                    daily_row[date_str] = f"{growth_rate:.2f}%"
+                                else:
+                                    daily_row[date_str] = "-"  # 用"-"代替None
+                            else:
+                                daily_row[date_str] = "-"  # 用"-"代替None
+                        
+                        theme_daily_data.append(daily_row)
+                
+                if theme_daily_data:
+                    # 创建DataFrame并导出到Excel
+                    daily_df = pd.DataFrame(theme_daily_data)
+                    daily_df.to_excel(writer, sheet_name=theme[:30], index=False)
+                    
+                    # 简化列宽调整（仅调整前几列，避免性能开销）
+                    worksheet = writer.sheets[theme[:30]]
+                    worksheet.column_dimensions['A'].width = 10  # 基金代码
+                    worksheet.column_dimensions['B'].width = 44  # 基金名称
+                    for col in ['C', 'D', 'E', 'F', 'G', 'H']:  # 日期列
+                        worksheet.column_dimensions[col].width = 12
+        
+        # 导出指定基金的详细历史数据
+        if specific_funds:
+            detailed_data = []
+            fund_codes = [fund['code'] for fund in specific_funds]
+            fund_names = [fund['name'] for fund in specific_funds]
+            
+            # 并行获取所有基金的历史数据（根据CPU核心数动态调整线程数）
+            max_workers = min(len(fund_codes), multiprocessing.cpu_count() * 2)
+            with concurrent.futures.ThreadPoolExecutor(max_workers=max_workers) as executor:
+                fund_data_list = list(executor.map(get_fund_history_data, fund_codes, [7]*len(fund_codes)))
+            
+            # 处理获取到的历史数据
+            for i, fund_data in enumerate(fund_data_list):
+                if not fund_data.empty:
+                    # 添加基金代码和名称列
+                    fund_data['基金代码'] = fund_codes[i]
+                    fund_data['基金名称'] = fund_names[i]
+                    detailed_data.append(fund_data)
+            
+            if detailed_data:
+                combined_data = pd.concat(detailed_data, ignore_index=True)
+                combined_data.to_excel(writer, sheet_name="详细历史数据", index=False)
+                
+                # 简化列宽调整（仅调整前几列，避免性能开销）
+                worksheet = writer.sheets["详细历史数据"]
+                worksheet.column_dimensions['A'].width = 10  # 基金代码
+                worksheet.column_dimensions['B'].width = 44  # 基金名称
+                for col in ['C', 'D', 'E', 'F', 'G', 'H']:  # 日期列
+                    worksheet.column_dimensions[col].width = 12
+    
+    # 计算并显示导出时间
+    export_time = time.time() - start_time
+    print(f"📊 基金数据已导出到: {filename}")
+    print(f"⏱️  导出耗时: {export_time:.2f} 秒")
+    return filename
+
+# 主执行函数
+def main():
+    """主执行函数"""
+    print("🚀 开始获取基金数据...")
+    
+    # 原有的数据获取和可视化代码
+    # ...
+    
+    # 生成周度数据报告
+    generate_weekly_report(results)
+    
+    # 导出基金数据到Excel表格
+    print("\n" + "="*60)
+    print("💾 开始导出基金数据到Excel表格...")
+    print("="*60)
+    export_fund_data_to_excel(results, specific_funds)
+    
+    print("\n✅ 所有数据报告生成完成")
+
+if __name__ == "__main__":
+    main()
